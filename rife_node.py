@@ -85,15 +85,6 @@ class PracticalRIFEInterpolate:
                     "description": "插帧倍数: 2=补1帧, 3=补2帧"
                 }),
             },
-            "optional": {
-                "gpu_id": ("INT", {
-                    "default": 0,
-                    "min": -1,
-                    "max": 4,
-                    "step": 1,
-                    "description": "-1=CPU, 0=GPU0, 1=GPU1..."
-                }),
-            }
         }
     
     RETURN_TYPES = ("IMAGE",)
@@ -101,12 +92,11 @@ class PracticalRIFEInterpolate:
     FUNCTION = "interpolate"
     CATEGORY = "video/frame-interpolation"
     
-    def interpolate(self, image1, image2, multi: int, gpu_id: int = 0) -> Tuple:
+    def interpolate(self, image1, image2, multi: int) -> Tuple:
         """两帧之间的补帧"""
         
         print(f"\n[Practical-RIFE] ========== 两帧补帧 ==========")
         print(f"[Practical-RIFE] 插帧倍数: {multi}x")
-        print(f"[Practical-RIFE] GPU ID: {gpu_id}")
         
         # 环境检查
         if not PIL_AVAILABLE:
@@ -138,10 +128,9 @@ class PracticalRIFEInterpolate:
                 output_dir = os.path.join(tmpdir, "output")
                 os.makedirs(output_dir, exist_ok=True)
                 
-                # 调用Practical-RIFE
+                # 使用ffmpeg创建临时视频
                 video_path = os.path.join(tmpdir, "input_video.mp4")
                 
-                # 使用ffmpeg创建临时视频
                 cmd_create_video = [
                     'ffmpeg', '-y',
                     '-framerate', '30',
@@ -158,12 +147,8 @@ class PracticalRIFEInterpolate:
                     raise RuntimeError(f"视频创建失败: {result.stderr}")
                 
                 # 调用Practical-RIFE进行插帧
-                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi}"
-                
-                if gpu_id >= 0:
-                    cmd_inference += f" --gpu_id={gpu_id}"
-                else:
-                    cmd_inference += " --cpu"
+                # 注意: Practical-RIFE不支持 --gpu_id 参数
+                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi} --model=/workspace/Practical-RIFE/train_log --scale=1.0"
                 
                 print(f"[Practical-RIFE] 执行插帧...")
                 print(f"[Practical-RIFE] 命令: {cmd_inference}")
@@ -181,10 +166,13 @@ class PracticalRIFEInterpolate:
                 output_video = os.path.join(output_dir, os.path.basename(video_path))
                 
                 if not os.path.exists(output_video):
-                    # Practical-RIFE可能改变输出名称，尝试查找
+                    # Practical-RIFE可能改变输出名称或位置，尝试查找
                     video_files = list(Path(output_dir).glob("*.mp4"))
+                    if not video_files:
+                        video_files = list(Path(tmpdir).glob("**/*.mp4"))
+                    
                     if video_files:
-                        output_video = str(video_files[0])
+                        output_video = str(video_files[-1])  # 取最新的
                     else:
                         raise FileNotFoundError("输出视频未生成")
                 
@@ -232,13 +220,6 @@ class PracticalRIFEVFI:
                 }),
             },
             "optional": {
-                "gpu_id": ("INT", {
-                    "default": 0,
-                    "min": -1,
-                    "max": 4,
-                    "step": 1,
-                    "description": "-1=CPU, 0=GPU0, 1=GPU1..."
-                }),
                 "filename_prefix": ("STRING", {
                     "default": "rife_video"
                 }),
@@ -254,7 +235,7 @@ class PracticalRIFEVFI:
     FUNCTION = "interpolate_video"
     CATEGORY = "video/frame-interpolation"
     
-    def interpolate_video(self, images, multi: int, gpu_id: int = 0,
+    def interpolate_video(self, images, multi: int,
                          filename_prefix: str = "rife_video",
                          save_output: bool = False) -> Tuple:
         """
@@ -269,7 +250,6 @@ class PracticalRIFEVFI:
         print(f"[Practical-RIFE VFI] 输入帧数: {num_frames}")
         print(f"[Practical-RIFE VFI] 插帧倍数: {multi}x")
         print(f"[Practical-RIFE VFI] 预期输出帧数: 约{num_frames * multi}")
-        print(f"[Practical-RIFE VFI] GPU ID: {gpu_id}")
         
         # 环境检查
         if not PIL_AVAILABLE:
@@ -311,13 +291,9 @@ class PracticalRIFEVFI:
                     raise RuntimeError(f"视频创建失败: {result.stderr}")
                 
                 # 调用Practical-RIFE
+                # 注意: Practical-RIFE的正确参数是 --model, --scale, --multi 等
                 print(f"[Practical-RIFE VFI] 执行插帧处理...")
-                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi}"
-                
-                if gpu_id >= 0:
-                    cmd_inference += f" --gpu_id={gpu_id}"
-                else:
-                    cmd_inference += " --cpu"
+                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi} --model=/workspace/Practical-RIFE/train_log --scale=1.0"
                 
                 print(f"[Practical-RIFE VFI] 命令: {cmd_inference}")
                 
@@ -325,6 +301,7 @@ class PracticalRIFEVFI:
                 
                 if result.returncode != 0:
                     print(f"[Practical-RIFE VFI] stderr: {result.stderr}")
+                    print(f"[Practical-RIFE VFI] stdout: {result.stdout}")
                     raise RuntimeError("插帧失败")
                 
                 print(f"[Practical-RIFE VFI] ✓ 插帧完成!")
@@ -334,11 +311,16 @@ class PracticalRIFEVFI:
                 if not os.path.exists(output_dir):
                     output_dir = os.path.dirname(video_path)
                 
+                # 搜索所有mp4文件，包括子目录
                 video_files = list(Path(output_dir).glob("*.mp4"))
+                if not video_files:
+                    video_files = list(Path(tmpdir).glob("**/*.mp4"))
+                
                 if not video_files:
                     raise FileNotFoundError("输出视频未找到")
                 
-                output_video = str(video_files[0])
+                output_video = str(video_files[-1])  # 取最新的
+                print(f"[Practical-RIFE VFI] 找到输出视频: {output_video}")
                 
                 # 使用ffmpeg提取所有帧
                 print(f"[Practical-RIFE VFI] 提取输出帧...")
@@ -359,6 +341,8 @@ class PracticalRIFEVFI:
                 # 读取输出帧
                 output_frames = []
                 frame_files = sorted(Path(output_frames_dir).glob("*.png"))
+                
+                print(f"[Practical-RIFE VFI] 找到 {len(frame_files)} 个输出帧")
                 
                 for frame_file in frame_files:
                     frame_pil = Image.open(frame_file)
