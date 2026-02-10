@@ -1,19 +1,21 @@
 """
-RIFE-NCNN-Vulkan ComfyUI 自定义节点
-已优化：即使本地环境缺失也能在 UI 界面连线和搭建工作流
+Practical-RIFE ComfyUI 自定义节点
+使用 Practical-RIFE 进行视频插帧
+https://github.com/hzwer/Practical-RIFE/
+
+安装位置: /workspace/Practical-RIFE/inference_video.py
 """
 
 import os
 import subprocess
 import tempfile
-import logging
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Optional
+from pathlib import Path
 
 import numpy as np
 import folder_paths
 
-# 尝试导入必要库，如果本地环境没有，节点依然会显示，但运行会报错
 try:
     from PIL import Image
     import torch
@@ -21,160 +23,382 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+PRACTICAL_RIFE_ROOT = "/workspace/Practical-RIFE"
+INFERENCE_SCRIPT = os.path.join(PRACTICAL_RIFE_ROOT, "inference_video.py")
 
-# ============================================================================
-# RIFE 配置 (这些路径主要针对你的远程服务器环境)
-# ============================================================================
-RIFE_ROOT = "/workspace/rife-ncnn-vulkan"
-RIFE_BINARY = os.path.join(RIFE_ROOT, "rife-ncnn-vulkan")
-MODELS_DIR = os.path.join(RIFE_ROOT, "models")
 
-# ============================================================================
-# 工具函数
-# ============================================================================
-
-def tensor_to_pil(tensor) -> 'Image.Image':
+def tensor_to_pil(tensor) -> Optional['Image.Image']:
     """PyTorch张量转PIL图片"""
     if not PIL_AVAILABLE:
-        raise ImportError("缺失必要的 Python 库 (torch 或 Pillow)")
+        return None
     
     if isinstance(tensor, torch.Tensor):
         tensor = tensor.cpu().numpy()
     
-    # 处理 batch 维度
     if len(tensor.shape) == 4:
         tensor = tensor[0]
     
-    if tensor.max() <= 1.0:
-        tensor = (tensor * 255).astype(np.uint8)
+    if tensor.max() > 1.0:
+        tensor = tensor / 255.0
     
-    return Image.fromarray(tensor)
+    tensor = (tensor * 255).astype(np.uint8)
+    
+    if len(tensor.shape) == 3 and tensor.shape[2] == 3:
+        return Image.fromarray(tensor, mode='RGB')
+    elif len(tensor.shape) == 3 and tensor.shape[2] == 4:
+        return Image.fromarray(tensor, mode='RGBA')
+    else:
+        return Image.fromarray(tensor[:, :, 0], mode='L')
+
 
 def pil_to_tensor(image: 'Image.Image') -> 'torch.Tensor':
     """PIL图片转PyTorch张量"""
+    if not PIL_AVAILABLE:
+        return None
+    
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
-    arr = np.array(image).astype(np.float32) / 255.0
-    return torch.from_numpy(arr).unsqueeze(0)
-
-# ============================================================================
-# RIFE 补帧节点类
-# ============================================================================
-
-class RIFEInterpolate:
-    """RIFE补帧节点 - 支持在本地无环境状态下占位连线"""
+    arr = np.array(image).astype(np.float32)
     
-    def __init__(self):
-        self.rife_binary = RIFE_BINARY
-        self.models_dir = MODELS_DIR
+    if arr.max() > 1.0:
+        arr = arr / 255.0
+    
+    tensor = torch.from_numpy(arr).unsqueeze(0)
+    return tensor
+
+
+class PracticalRIFEInterpolate:
+    """Practical-RIFE 两帧补帧"""
     
     @classmethod
     def INPUT_TYPES(cls):
-        # 核心改动：使用静态列表，防止在本地因为找不到文件夹而导致加载失败
-        available_models = ['rife-v4', 'rife49', 'rife414', 'rife-v2', 'rife-v3']
-        
         return {
             "required": {
                 "image1": ("IMAGE",),
                 "image2": ("IMAGE",),
-                "model": (available_models, {"default": "rife-v4"}),
-                "num_frames": ("INT", {"default": 2, "min": 2, "max": 10, "step": 1}),
+                "multi": ("INT", {
+                    "default": 2,
+                    "min": 2,
+                    "max": 8,
+                    "step": 1,
+                    "description": "插帧倍数: 2=补1帧, 3=补2帧"
+                }),
             },
             "optional": {
-                "time_step": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "enable_tta": ("BOOLEAN", {"default": False}),
-                "gpu_id": ("INT", {"default": -2, "min": -2, "max": 4, "step": 1}),
-                "filename_prefix": ("STRING", {"default": "rife_interpolated"}),
-                "save_output": ("BOOLEAN", {"default": False}),
+                "gpu_id": ("INT", {
+                    "default": 0,
+                    "min": -1,
+                    "max": 4,
+                    "step": 1,
+                    "description": "-1=CPU, 0=GPU0, 1=GPU1..."
+                }),
             }
         }
     
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("IMAGE",)
     FUNCTION = "interpolate"
-    CATEGORY = "image/interpolation"
+    CATEGORY = "video/frame-interpolation"
     
-    def interpolate(self, image1, image2, model: str, num_frames: int, 
-                   time_step: float = 0.5, enable_tta: bool = False, 
-                   gpu_id: int = -2, filename_prefix: str = "rife_interpolated",
-                   save_output: bool = False) -> Tuple:
-        """执行补帧逻辑"""
+    def interpolate(self, image1, image2, multi: int, gpu_id: int = 0) -> Tuple:
+        """两帧之间的补帧"""
         
-        # 1. 运行时环境检查：只有运行到这一步才会报错
-        if not os.path.exists(self.rife_binary):
-            error_msg = f"运行时错误：在路径 {self.rife_binary} 未找到 RIFE 执行程序。本地连线调试请忽略，运行请在配置好环境的服务器上执行。"
-            logger.error(error_msg)
-            raise FileNotFoundError(error_msg)
-
+        print(f"\n[Practical-RIFE] ========== 两帧补帧 ==========")
+        print(f"[Practical-RIFE] 插帧倍数: {multi}x")
+        print(f"[Practical-RIFE] GPU ID: {gpu_id}")
+        
+        # 环境检查
         if not PIL_AVAILABLE:
-            raise RuntimeError("Python 环境缺失必要的库 (torch/Pillow)")
+            raise Exception("缺少Python库: pip install Pillow torch")
         
-        logger.info(f"开始补帧: 模型={model}, 帧数={num_frames}")
+        if not os.path.exists(INFERENCE_SCRIPT):
+            raise FileNotFoundError(f"Practical-RIFE脚本不存在: {INFERENCE_SCRIPT}")
         
+        print(f"[Practical-RIFE] ✓ 环境检查通过")
+        
+        # 执行补帧
         with tempfile.TemporaryDirectory() as tmpdir:
             try:
+                # 转换为PIL并保存
                 img1_pil = tensor_to_pil(image1)
                 img2_pil = tensor_to_pil(image2)
                 
-                img1_path = os.path.join(tmpdir, "input0.png")
-                img2_path = os.path.join(tmpdir, "input1.png")
-                output_path = os.path.join(tmpdir, "output.png")
+                if img1_pil is None or img2_pil is None:
+                    raise Exception("图片转换失败")
+                
+                # 保存为视频的帧
+                img1_path = os.path.join(tmpdir, "frame_0000.png")
+                img2_path = os.path.join(tmpdir, "frame_0001.png")
                 
                 img1_pil.save(img1_path)
                 img2_pil.save(img2_path)
                 
-                model_path = os.path.join(self.models_dir, model)
+                # 创建输出目录
+                output_dir = os.path.join(tmpdir, "output")
+                os.makedirs(output_dir, exist_ok=True)
                 
-                # 构建命令行参数
-                cmd = [
-                    self.rife_binary,
-                    "-m", model_path,
-                    "-0", img1_path,
-                    "-1", img2_path,
-                    "-o", output_path,
-                    "-n", str(num_frames),
-                    "-s", str(time_step),
+                # 调用Practical-RIFE
+                video_path = os.path.join(tmpdir, "input_video.mp4")
+                
+                # 使用ffmpeg创建临时视频
+                cmd_create_video = [
+                    'ffmpeg', '-y',
+                    '-framerate', '30',
+                    '-i', os.path.join(tmpdir, 'frame_%04d.png'),
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    video_path
                 ]
                 
-                if gpu_id >= -1:
-                    cmd.extend(["-g", str(gpu_id)])
-                if enable_tta:
-                    cmd.extend(["-x", "-z"])
-                
-                # 运行 RIFE
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                print(f"[Practical-RIFE] 创建临时视频...")
+                result = subprocess.run(cmd_create_video, capture_output=True, text=True)
                 
                 if result.returncode != 0:
-                    raise RuntimeError(f"RIFE 执行失败: {result.stderr}")
+                    raise RuntimeError(f"视频创建失败: {result.stderr}")
                 
-                if not os.path.exists(output_path):
-                    raise FileNotFoundError(f"输出文件未生成: {output_path}")
+                # 调用Practical-RIFE进行插帧
+                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi}"
                 
-                output_pil = Image.open(output_path)
+                if gpu_id >= 0:
+                    cmd_inference += f" --gpu_id={gpu_id}"
+                else:
+                    cmd_inference += " --cpu"
+                
+                print(f"[Practical-RIFE] 执行插帧...")
+                print(f"[Practical-RIFE] 命令: {cmd_inference}")
+                
+                result = subprocess.run(cmd_inference, shell=True, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    print(f"[Practical-RIFE] stderr: {result.stderr}")
+                    print(f"[Practical-RIFE] stdout: {result.stdout}")
+                    raise RuntimeError(f"插帧失败")
+                
+                print(f"[Practical-RIFE] ✓ 补帧完成！\n")
+                
+                # 读取输出文件
+                output_video = os.path.join(output_dir, os.path.basename(video_path))
+                
+                if not os.path.exists(output_video):
+                    # Practical-RIFE可能改变输出名称，尝试查找
+                    video_files = list(Path(output_dir).glob("*.mp4"))
+                    if video_files:
+                        output_video = str(video_files[0])
+                    else:
+                        raise FileNotFoundError("输出视频未生成")
+                
+                # 使用ffmpeg提取第一帧
+                output_frame = os.path.join(tmpdir, "output_frame.png")
+                cmd_extract = [
+                    'ffmpeg', '-y',
+                    '-i', output_video,
+                    '-frames:v', '1',
+                    output_frame
+                ]
+                
+                result = subprocess.run(cmd_extract, capture_output=True, text=True)
+                
+                if not os.path.exists(output_frame):
+                    raise FileNotFoundError("无法提取输出帧")
+                
+                output_pil = Image.open(output_frame)
                 output_tensor = pil_to_tensor(output_pil)
-                
-                if save_output:
-                    output_dir = folder_paths.get_output_directory()
-                    timestamp = datetime.now().strftime("%H%M%S")
-                    save_path = os.path.join(output_dir, f"{filename_prefix}_{timestamp}.png")
-                    output_pil.save(save_path)
                 
                 return (output_tensor,)
             
             except Exception as e:
-                logger.error(f"补帧处理失败: {e}")
-                raise
+                raise Exception(f"补帧失败: {str(e)}")
 
-# ============================================================================
-# 节点注册
-# ============================================================================
+
+class PracticalRIFEVFI:
+    """Practical-RIFE 视频插帧（推荐方式）
+    
+    直接用Practical-RIFE的inference_video.py处理视频
+    输入帧序列，输出插帧后的帧序列
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),  # 帧序列
+                "multi": ("INT", {
+                    "default": 2,
+                    "min": 2,
+                    "max": 8,
+                    "step": 1,
+                    "description": "插帧倍数: 2=30fps->60fps, 3=30fps->90fps"
+                }),
+            },
+            "optional": {
+                "gpu_id": ("INT", {
+                    "default": 0,
+                    "min": -1,
+                    "max": 4,
+                    "step": 1,
+                    "description": "-1=CPU, 0=GPU0, 1=GPU1..."
+                }),
+                "filename_prefix": ("STRING", {
+                    "default": "rife_video"
+                }),
+                "save_output": ("BOOLEAN", {
+                    "default": False,
+                    "description": "保存到ComfyUI output目录"
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("IMAGE",)
+    FUNCTION = "interpolate_video"
+    CATEGORY = "video/frame-interpolation"
+    
+    def interpolate_video(self, images, multi: int, gpu_id: int = 0,
+                         filename_prefix: str = "rife_video",
+                         save_output: bool = False) -> Tuple:
+        """
+        使用Practical-RIFE进行视频插帧
+        
+        输入: 帧序列
+        输出: 插帧后的帧序列
+        """
+        
+        num_frames = images.shape[0]
+        print(f"\n[Practical-RIFE VFI] ========== 视频插帧处理 ==========")
+        print(f"[Practical-RIFE VFI] 输入帧数: {num_frames}")
+        print(f"[Practical-RIFE VFI] 插帧倍数: {multi}x")
+        print(f"[Practical-RIFE VFI] 预期输出帧数: 约{num_frames * multi}")
+        print(f"[Practical-RIFE VFI] GPU ID: {gpu_id}")
+        
+        # 环境检查
+        if not PIL_AVAILABLE:
+            raise Exception("缺少Python库: pip install Pillow torch")
+        
+        if not os.path.exists(INFERENCE_SCRIPT):
+            raise FileNotFoundError(f"Practical-RIFE脚本不存在: {INFERENCE_SCRIPT}")
+        
+        print(f"[Practical-RIFE VFI] ✓ 环境检查通过")
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                # 保存帧为PNG序列
+                print(f"[Practical-RIFE VFI] 保存帧序列...")
+                for i, frame in enumerate(images):
+                    pil_frame = tensor_to_pil(frame)
+                    if pil_frame is None:
+                        raise Exception(f"帧{i}转换失败")
+                    
+                    frame_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
+                    pil_frame.save(frame_path)
+                
+                # 使用ffmpeg创建视频
+                print(f"[Practical-RIFE VFI] 创建输入视频...")
+                video_path = os.path.join(tmpdir, "input_video.mp4")
+                
+                cmd_create_video = [
+                    'ffmpeg', '-y',
+                    '-framerate', '30',
+                    '-i', os.path.join(tmpdir, 'frame_%04d.png'),
+                    '-c:v', 'libx264',
+                    '-pix_fmt', 'yuv420p',
+                    video_path
+                ]
+                
+                result = subprocess.run(cmd_create_video, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    raise RuntimeError(f"视频创建失败: {result.stderr}")
+                
+                # 调用Practical-RIFE
+                print(f"[Practical-RIFE VFI] 执行插帧处理...")
+                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi}"
+                
+                if gpu_id >= 0:
+                    cmd_inference += f" --gpu_id={gpu_id}"
+                else:
+                    cmd_inference += " --cpu"
+                
+                print(f"[Practical-RIFE VFI] 命令: {cmd_inference}")
+                
+                result = subprocess.run(cmd_inference, shell=True, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    print(f"[Practical-RIFE VFI] stderr: {result.stderr}")
+                    raise RuntimeError("插帧失败")
+                
+                print(f"[Practical-RIFE VFI] ✓ 插帧完成!")
+                
+                # 查找输出视频
+                output_dir = os.path.join(tmpdir, "output")
+                if not os.path.exists(output_dir):
+                    output_dir = os.path.dirname(video_path)
+                
+                video_files = list(Path(output_dir).glob("*.mp4"))
+                if not video_files:
+                    raise FileNotFoundError("输出视频未找到")
+                
+                output_video = str(video_files[0])
+                
+                # 使用ffmpeg提取所有帧
+                print(f"[Practical-RIFE VFI] 提取输出帧...")
+                output_frames_dir = os.path.join(tmpdir, "output_frames")
+                os.makedirs(output_frames_dir, exist_ok=True)
+                
+                cmd_extract = [
+                    'ffmpeg', '-y',
+                    '-i', output_video,
+                    os.path.join(output_frames_dir, 'frame_%04d.png')
+                ]
+                
+                result = subprocess.run(cmd_extract, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    raise RuntimeError("提取帧失败")
+                
+                # 读取输出帧
+                output_frames = []
+                frame_files = sorted(Path(output_frames_dir).glob("*.png"))
+                
+                for frame_file in frame_files:
+                    frame_pil = Image.open(frame_file)
+                    frame_tensor = pil_to_tensor(frame_pil)
+                    output_frames.append(frame_tensor)
+                
+                if not output_frames:
+                    raise Exception("没有输出帧")
+                
+                # 合并帧
+                output_tensor = torch.cat(output_frames, dim=0)
+                
+                print(f"[Practical-RIFE VFI] ✓ 完成！")
+                print(f"[Practical-RIFE VFI] 输出帧数: {output_tensor.shape[0]}")
+                
+                # 保存到输出目录
+                if save_output:
+                    output_dir = folder_paths.get_output_directory()
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    for idx, frame in enumerate(output_frames):
+                        save_filename = f"{filename_prefix}_{timestamp}_{idx:04d}.png"
+                        save_path = os.path.join(output_dir, save_filename)
+                        frame_pil = tensor_to_pil(frame)
+                        frame_pil.save(save_path)
+                    print(f"[Practical-RIFE VFI] ✓ 已保存到输出目录")
+                
+                print(f"[Practical-RIFE VFI] ==========================================\n")
+                
+                return (output_tensor,)
+            
+            except Exception as e:
+                raise Exception(f"视频插帧失败: {str(e)}")
+
 
 NODE_CLASS_MAPPINGS = {
-    "RIFEInterpolate": RIFEInterpolate,
+    "PracticalRIFEInterpolate": PracticalRIFEInterpolate,
+    "PracticalRIFEVFI": PracticalRIFEVFI,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "RIFEInterpolate": "RIFE 补帧 (云端预览/占位)",
+    "PracticalRIFEInterpolate": "Practical-RIFE 两帧补帧",
+    "PracticalRIFEVFI": "Practical-RIFE 视频插帧",
 }
