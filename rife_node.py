@@ -272,12 +272,16 @@ class PracticalRIFEVFI:
                     frame_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
                     pil_frame.save(frame_path)
                 
+                # 创建输出目录
+                output_base_dir = os.path.join(tmpdir, "output")
+                os.makedirs(output_base_dir, exist_ok=True)
+                
                 # 使用ffmpeg创建视频
                 print(f"[Practical-RIFE VFI] 创建输入视频...")
                 video_path = os.path.join(tmpdir, "input_video.mp4")
                 
                 cmd_create_video = [
-                    'ffmpeg', '-y',
+                    'ffmpeg', '-y', '-loglevel', 'error',
                     '-framerate', '30',
                     '-i', os.path.join(tmpdir, 'frame_%04d.png'),
                     '-c:v', 'libx264',
@@ -291,36 +295,47 @@ class PracticalRIFEVFI:
                     raise RuntimeError(f"视频创建失败: {result.stderr}")
                 
                 # 调用Practical-RIFE
-                # 注意: Practical-RIFE的正确参数是 --model, --scale, --multi 等
+                # 重要: Practical-RIFE会在当前工作目录或指定的输出目录创建结果
                 print(f"[Practical-RIFE VFI] 执行插帧处理...")
-                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi} --model=/workspace/Practical-RIFE/train_log --scale=1.0"
+                
+                # 使用output参数指定输出目录
+                cmd_inference = f"python3 {INFERENCE_SCRIPT} --video={video_path} --multi={multi} --model=/workspace/Practical-RIFE/train_log --scale=1.0 --output={output_base_dir}"
                 
                 print(f"[Practical-RIFE VFI] 命令: {cmd_inference}")
                 
-                result = subprocess.run(cmd_inference, shell=True, capture_output=True, text=True)
+                result = subprocess.run(cmd_inference, shell=True, capture_output=True, text=True, cwd=tmpdir)
+                
+                print(f"[Practical-RIFE VFI] stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"[Practical-RIFE VFI] stderr: {result.stderr}")
                 
                 if result.returncode != 0:
-                    print(f"[Practical-RIFE VFI] stderr: {result.stderr}")
-                    print(f"[Practical-RIFE VFI] stdout: {result.stdout}")
                     raise RuntimeError("插帧失败")
                 
                 print(f"[Practical-RIFE VFI] ✓ 插帧完成!")
                 
-                # 查找输出视频
-                output_dir = os.path.join(tmpdir, "output")
-                if not os.path.exists(output_dir):
-                    output_dir = os.path.dirname(video_path)
+                # 查找输出视频（Practical-RIFE会生成新视频）
+                # 尝试多个可能的位置
+                possible_dirs = [
+                    output_base_dir,
+                    os.path.join(output_base_dir, "results"),
+                    tmpdir,
+                ]
                 
-                # 搜索所有mp4文件，包括子目录
-                video_files = list(Path(output_dir).glob("*.mp4"))
-                if not video_files:
-                    video_files = list(Path(tmpdir).glob("**/*.mp4"))
+                output_video = None
+                for search_dir in possible_dirs:
+                    if os.path.exists(search_dir):
+                        print(f"[Practical-RIFE VFI] 搜索目录: {search_dir}")
+                        video_files = list(Path(search_dir).glob("*.mp4"))
+                        if video_files:
+                            # 找最新修改的文件（应该是输出视频）
+                            output_video = max(video_files, key=lambda p: p.stat().st_mtime)
+                            output_video = str(output_video)
+                            print(f"[Practical-RIFE VFI] 找到输出视频: {output_video}")
+                            break
                 
-                if not video_files:
-                    raise FileNotFoundError("输出视频未找到")
-                
-                output_video = str(video_files[-1])  # 取最新的
-                print(f"[Practical-RIFE VFI] 找到输出视频: {output_video}")
+                if not output_video:
+                    raise FileNotFoundError("未找到输出视频")
                 
                 # 使用ffmpeg提取所有帧
                 print(f"[Practical-RIFE VFI] 提取输出帧...")
@@ -328,7 +343,7 @@ class PracticalRIFEVFI:
                 os.makedirs(output_frames_dir, exist_ok=True)
                 
                 cmd_extract = [
-                    'ffmpeg', '-y',
+                    'ffmpeg', '-y', '-loglevel', 'error',
                     '-i', output_video,
                     os.path.join(output_frames_dir, 'frame_%04d.png')
                 ]
@@ -336,7 +351,7 @@ class PracticalRIFEVFI:
                 result = subprocess.run(cmd_extract, capture_output=True, text=True)
                 
                 if result.returncode != 0:
-                    raise RuntimeError("提取帧失败")
+                    raise RuntimeError(f"提取帧失败: {result.stderr}")
                 
                 # 读取输出帧
                 output_frames = []
@@ -356,7 +371,9 @@ class PracticalRIFEVFI:
                 output_tensor = torch.cat(output_frames, dim=0)
                 
                 print(f"[Practical-RIFE VFI] ✓ 完成！")
+                print(f"[Practical-RIFE VFI] 输入帧数: {num_frames}")
                 print(f"[Practical-RIFE VFI] 输出帧数: {output_tensor.shape[0]}")
+                print(f"[Practical-RIFE VFI] 倍数验证: {output_tensor.shape[0] / num_frames:.2f}x")
                 
                 # 保存到输出目录
                 if save_output:
