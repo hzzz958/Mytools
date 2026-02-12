@@ -7,6 +7,8 @@ from .ffmpeg_node import NODE_CLASS_MAPPINGS as FFmpegMappings
 from .ffmpeg_node import NODE_DISPLAY_NAME_MAPPINGS as FFmpegNames
 from .ffmpeg_concat_node import NODE_CLASS_MAPPINGS as ConcatMappings
 from .ffmpeg_concat_node import NODE_DISPLAY_NAME_MAPPINGS as ConcatNames
+from .my_rife_node import NODE_CLASS_MAPPINGS as RifeMappings  # 新增：导入 RIFE 节点
+from .my_rife_node import NODE_DISPLAY_NAME_MAPPINGS as RifeNames  # 新增：导入 RIFE 节点
 
 # 合并所有节点
 NODE_CLASS_MAPPINGS = {**FFmpegMappings, **RifeMappings, **ConcatMappings}
