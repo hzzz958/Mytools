@@ -5,8 +5,6 @@
 
 from .ffmpeg_node import NODE_CLASS_MAPPINGS as FFmpegMappings
 from .ffmpeg_node import NODE_DISPLAY_NAME_MAPPINGS as FFmpegNames
-from .rife_node import NODE_CLASS_MAPPINGS as RifeMappings
-from .rife_node import NODE_DISPLAY_NAME_MAPPINGS as RifeNames
 from .ffmpeg_concat_node import NODE_CLASS_MAPPINGS as ConcatMappings
 from .ffmpeg_concat_node import NODE_DISPLAY_NAME_MAPPINGS as ConcatNames
 
