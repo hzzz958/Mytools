@@ -22,6 +22,7 @@ class PracticalRIFE_Direct:
     - 可调节显存占用，适合 3090 等显卡
     - 启动时不加载模型，确保节点一定能显示
     - 运行工作流时才加载模型并执行插帧
+    - 重要提醒：RIFEv4.26 模型对输入分辨率要求严格，宽度和高度必须能被 64 整除（如 1080×1920、1920×1088 等），否则容易报 tensor size mismatch 错误
     """
     def __init__(self):
         self.model = None
@@ -33,7 +34,10 @@ class PracticalRIFE_Direct:
             "required": {
                 "images": ("IMAGE", {
                     "tooltip": "输入图像序列（通常是从 Load Image Batch 或 Video to Images 节点获取）\n"
-                               "要求：连续帧，按顺序排列"
+                               "要求：连续帧，按顺序排列\n"
+                               "重要：所有帧的分辨率必须完全一致，且宽度/高度最好能被 64 整除（如 1080×1920、1920×1088）\n"
+                               "不满足 mod 64 容易导致 RIFE 内部报错（tensor size mismatch）\n"
+                               "推荐先用 Resize 节点统一到 1080×1920 再输入"
                 }),
                 "multi": ("INT", {
                     "default": 2,
@@ -52,7 +56,8 @@ class PracticalRIFE_Direct:
                     "step": 0.1,
                     "tooltip": "模型内部缩放比例（通常保持1.0）\n"
                                "调小可加速、降低显存占用\n"
-                               "调大可提升细节（但显存和时间增加）"
+                               "调大可提升细节（但显存和时间增加）\n"
+                               "注意：scale 过大会放大分辨率不兼容问题"
                 }),
                 "vram_limit_frames": ("INT", {
                     "default": 1,
@@ -72,6 +77,12 @@ class PracticalRIFE_Direct:
     CATEGORY = "Video/Interpolation"
 
     def interpolate(self, images, multi, scale, vram_limit_frames):
+        """
+        执行帧插值处理
+        - 模型会在第一次运行时加载（延迟加载）
+        - 输入帧必须分辨率一致，且最好 mod 64（如 1080×1920）
+        - 如果报 tensor size mismatch，请先用 Resize 节点统一尺寸到 1080×1920
+        """
         # 模型加载移到这里：运行工作流时才执行
         if self.model is None:
             try:
@@ -94,51 +105,54 @@ class PracticalRIFE_Direct:
 
         n, h, w, c = images.shape
         start_time = time.time()
-       
+      
         # 将输入帧放到 GPU
         frames = images.permute(0, 3, 1, 2).to(self.device)
-        output_frames_cpu = []          # 最终存放在系统内存的结果
-        temp_gpu_buffer = []            # 显存缓冲区
-       
+        output_frames_cpu = [] # 最终存放在系统内存的结果
+        temp_gpu_buffer = [] # 显存缓冲区
+      
         print(f"[Practical-RIFE] 🚀 启动！显存缓冲上限: {vram_limit_frames} 帧")
-       
+        print(f"[RIFE 分辨率检查] 输入帧尺寸: {w}×{h}（批次中共 {n} 帧）")
+        print("  注意：RIFEv4.26 要求宽度/高度能被 64 整除，否则可能报 tensor size mismatch")
+        print("  如果出错，请先 Resize 到 1080×1920 或其他 mod 64 尺寸")
+      
         with torch.no_grad():
             for i in range(n - 1):
                 I0 = frames[i:i+1]
                 I1 = frames[i+1:i+2]
-               
+              
                 # 放入起始帧
                 temp_gpu_buffer.append(I0)
-               
+              
                 # 插帧计算
                 for step in range(1, multi):
                     timestep = step / multi
                     interp_frame = self.model.inference(I0, I1, timestep=timestep, scale=scale)
                     temp_gpu_buffer.append(interp_frame)
-               
+              
                 # --- 核心：显存水位控制 ---
                 if len(temp_gpu_buffer) >= vram_limit_frames:
                     # 批量搬运到 CPU，腾出显存空间
                     cpu_batch = torch.cat(temp_gpu_buffer, dim=0).cpu()
                     output_frames_cpu.append(cpu_batch)
-                    temp_gpu_buffer = []  # 清空 GPU 缓冲区
-                    torch.cuda.empty_cache()  # 强制释放显存碎片
-               
+                    temp_gpu_buffer = [] # 清空 GPU 缓冲区
+                    torch.cuda.empty_cache() # 强制释放显存碎片
+              
                 if i % 50 == 0 and i > 0:
                     print(f"[Practical-RIFE] 进度: {i}/{n} | 瞬时速度: {i/(time.time()-start_time):.2f} it/s")
-            
+           
             # 处理最后一帧和残余缓冲区
             temp_gpu_buffer.append(frames[-1:])
             if temp_gpu_buffer:
                 output_frames_cpu.append(torch.cat(temp_gpu_buffer, dim=0).cpu())
-        
+       
         # 内存合并
         out_tensor = torch.cat(output_frames_cpu, dim=0)
         out_tensor = out_tensor.permute(0, 2, 3, 1)
-       
+      
         duration = time.time() - start_time
         print(f"✅ 任务结束! 总耗时: {duration:.2f}s | 平均速度: {n/duration:.2f} it/s")
-       
+      
         return (out_tensor,)
 
 NODE_CLASS_MAPPINGS = {"PracticalRIFE_Direct": PracticalRIFE_Direct}
