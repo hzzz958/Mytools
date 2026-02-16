@@ -195,7 +195,13 @@ class PracticalRIFE_Direct:
         决策最优处理策略
         返回字典包含处理方式、段大小、内存占用等信息
         """
-        # 测试一下 torch 能用的内存
+        # 获取系统总内存
+        try:
+            total_system_memory_gb = psutil.virtual_memory().total / (1024**3)
+        except:
+            total_system_memory_gb = 128  # 默认假设 128GB
+        
+        # 获取 GPU 显存
         if torch.cuda.is_available():
             try:
                 gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
@@ -203,6 +209,16 @@ class PracticalRIFE_Direct:
                 gpu_mem_gb = 24  # 保守估计 3090
         else:
             gpu_mem_gb = 0
+        
+        # ==================== BUG FIX ====================
+        # 如果 memory_limit_gb 设置过高（接近系统总内存），自动调低
+        # 原来的问题：memory_limit_gb=50，系统只有 62GB，导致爆内存
+        # 修复：确保内存限制不超过系统的 45%（留余量给系统和 Swap）
+        max_safe_limit_gb = int(total_system_memory_gb * 0.45)
+        if memory_limit_gb > max_safe_limit_gb:
+            print(f"\n  ⚠️  内存限制过高（{memory_limit_gb}GB > 系统可安全用 {max_safe_limit_gb}GB）")
+            print(f"     自动调降至 {max_safe_limit_gb}GB 以避免爆内存")
+            memory_limit_gb = max_safe_limit_gb
         
         # 段大小候选
         if n < 512:
@@ -246,11 +262,14 @@ class PracticalRIFE_Direct:
         
         # 如果预测的内存超过限制，自动降低段大小
         if total_peak_memory > memory_limit_gb:
-            # 激进降低
-            segment_size = max(32, segment_size // 2)
+            # 激进降低段大小，直到符合内存限制
+            reduction_factor = int(total_peak_memory / memory_limit_gb) + 1
+            segment_size = max(32, segment_size // reduction_factor)
             num_segments = (n + segment_size - 1) // segment_size
             name = f'分段处理 (自动降低) (segment_size={segment_size})'
-            print(f"\n  ⚠️  检测到内存压力，自动降低段大小到 {segment_size}")
+            print(f"\n  ⚠️  检测到内存压力，自动降低段大小")
+            print(f"     原预测：{total_peak_memory:.1f}GB > 限制：{memory_limit_gb}GB")
+            print(f"     调整段大小为：{segment_size}")
         
         return {
             'type': strategy_type,
