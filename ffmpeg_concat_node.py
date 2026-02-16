@@ -1013,107 +1013,162 @@ class FFmpegVideoConcatenate:
             }
     
     def _concatenate_with_crossfade(self, video_info_list, temp_dir, output_width, output_height,
-                                   output_fps, transition_duration, video_codec, video_quality,
-                                   audio_codec, audio_bitrate, scale_mode, deinterlace, logger, preview_info):
+                                output_fps, transition_duration, video_codec, video_quality,
+                                audio_codec, audio_bitrate, scale_mode, deinterlace, logger, preview_info):
         """
-        交叉淡化（渐入渐出）模式实现
-        
-        工作原理：
-        使用 FFmpeg 的 xfade filter 实现视频交叉淡化效果
+        交叉淡化（渐入渐出）模式实现 - 音视频同步过渡
         """
         try:
             if preview_info == "yes":
-                logger.add_section("6. 执行拼接（交叉淡化模式 - 渐入渐出）")
-            
+                logger.add_section("6. 执行拼接（交叉淡化模式 - 音视频同步渐入渐出）")
+                logger.add_log(f" 过渡时长: {transition_duration}秒")
+
+            if len(video_info_list) <= 1:
+                if preview_info == "yes":
+                    logger.add_log(" 只有一个视频，无需过渡，直接返回原文件")
+                return {
+                    'success': True,
+                    'temp_output': video_info_list[0]['path']  # 直接用原始路径（或预处理后的）
+                }
+
             if preview_info == "yes":
-                logger.add_log("  【子步骤】预处理视频文件...")
-            
+                logger.add_log(" 【子步骤1】预处理所有视频（统一分辨率、帧率）...")
+
             preprocessed_files = []
             crf_map = {"low": 28, "medium": 18, "high": 10}
             crf = crf_map.get(video_quality, 18)
-            
-            # 先对所有视频进行基础预处理
+
+            # 预处理：统一尺寸、帧率（但不加任何淡化滤镜）
             for idx, video_info in enumerate(video_info_list, 1):
                 video_path = video_info['path']
                 filename = video_info['filename']
-                
+
                 prep_filename = f"video_{idx:03d}_prep.mp4"
                 prep_output = os.path.join(temp_dir, prep_filename)
-                
+
                 if preview_info == "yes":
-                    logger.add_log(f"    [{idx}/{len(video_info_list)}] 处理 {filename}...")
-                
+                    logger.add_log(f"  [{idx}/{len(video_info_list)}] 处理 {filename}...")
+
                 scale_filter = self._build_scale_filter(scale_mode, output_width, output_height, deinterlace)
-                
+
+                # 如果原始帧率与输出不一致，才强制转换
+                r_filter = f"-r {output_fps}" if abs(video_info['fps'] - output_fps) > 0.1 else ""
+
                 cmd = [
-                    'ffmpeg',
-                    '-y',
+                    'ffmpeg', '-y',
                     '-i', video_path,
                     '-vf', scale_filter,
-                    '-r', str(output_fps),
+                ]
+                if r_filter:
+                    cmd.extend(['-r', str(output_fps)])
+
+                cmd.extend([
                     '-c:v', video_codec,
                     '-crf', str(crf),
                     '-c:a', audio_codec,
                     '-b:a', audio_bitrate,
+                    '-map', '0:v?',   # 视频轨（可选，防止无视频崩溃）
+                    '-map', '0:a?',   # 音频轨（可选）
                     prep_output
-                ]
-                
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=None)
+                ])
+
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
                 preprocessed_files.append(prep_output)
-                
+
                 if preview_info == "yes":
-                    logger.add_log(f"      ✓ 完成")
-            
-            # 应用交叉淡化
+                    logger.add_log("   ✓ 完成")
+
+            # ────────────────────────────────────────────────
+            # 核心：构建音视频交叉淡化 filter_complex
+            # ────────────────────────────────────────────────
             if preview_info == "yes":
-                logger.add_log("  【子步骤】应用交叉淡化效果...")
-            
-            current_output = preprocessed_files[0]
-            
+                logger.add_log(" 【子步骤2】构建交叉淡化滤镜链...")
+
+            filter_parts = []
+            inputs = []
+            video_label = "[0:v]"
+            audio_label = "[0:a]"
+
+            # 累计 offset，用于计算每个过渡的开始位置
+            cumulative_duration = 0.0
+
             for i in range(1, len(preprocessed_files)):
-                next_input = preprocessed_files[i]
-                temp_output = os.path.join(temp_dir, f"concat_{i}.mp4")
-                
-                if preview_info == "yes":
-                    logger.add_log(f"    正在处理过渡 {i}/{len(preprocessed_files)-1}...")
-                
-                xfade_cmd = [
-                    'ffmpeg',
-                    '-y',
-                    '-i', current_output,
-                    '-i', next_input,
-                    '-filter_complex',
-                    f"[0][1]xfade=transition=fade:duration={transition_duration}:offset={max(0, 10 - transition_duration)}",
-                    '-c:v', video_codec,
-                    '-crf', str(crf),
-                    '-c:a', audio_codec,
-                    '-b:a', audio_bitrate,
-                    temp_output
-                ]
-                
-                result = subprocess.run(xfade_cmd, check=True, capture_output=True, text=True, timeout=None)
-                current_output = temp_output
-                
-                if preview_info == "yes":
-                    logger.add_log(f"      ✓ 过渡 {i} 完成")
-            
-            # 最终输出
-            output_path = os.path.join(temp_dir, "output.mp4")
-            shutil.move(current_output, output_path)
-            
+                prev_duration = video_info_list[i-1]['duration']
+                # offset = 前一段累计时长 + 前一段时长 - 过渡时长（重叠过渡）
+                offset = max(0, cumulative_duration + prev_duration - transition_duration)
+                cumulative_duration = offset  # 更新累计
+
+                v_out = f"[v{i}]"
+                a_out = f"[a{i}]"
+
+                # 视频：xfade
+                filter_parts.append(
+                    f"{video_label}[{i}:v]xfade=transition=fade:duration={transition_duration}:offset={offset}{v_out}"
+                )
+
+                # 音频：acrossfade（使用三角窗，声音过渡自然）
+                # 先检查当前视频是否有音频
+                has_audio = video_info_list[i]['has_audio']
+
+                if has_audio:
+                    audio_input = f"[{i}:a]"
+                else:
+                    # 无音频 → 生成静音轨（长度与视频匹配）
+                    audio_input = f"anullsrc=r=48000:cl=stereo,atrim=0:{prev_duration}[silence{i}]"
+                    filter_parts.append(audio_input)
+                    audio_input = f"[silence{i}]"
+
+                filter_parts.append(
+                    f"{audio_label}{audio_input}acrossfade=d={transition_duration}:curve1=ipar:curve2=ipar{a_out}"
+                )
+
+                video_label = v_out
+                audio_label = a_out
+
+            filter_complex = ";".join(filter_parts)
+
+            # ────────────────────────────────────────────────
+            # 最终 FFmpeg 命令 - 一次性完成所有过渡
+            # ────────────────────────────────────────────────
             if preview_info == "yes":
-                logger.add_log("    ✓ 拼接完成（交叉淡化效果）")
-            
+                logger.add_log(" 【子步骤3】执行最终交叉淡化拼接...")
+
+            output_path = os.path.join(temp_dir, "final_crossfade.mp4")
+
+            cmd = ['ffmpeg', '-y']
+            for prep_file in preprocessed_files:
+                cmd.extend(['-i', prep_file])
+
+            cmd.extend([
+                '-filter_complex', filter_complex,
+                '-map', video_label,
+                '-map', audio_label,
+                '-c:v', video_codec,
+                '-crf', str(crf),
+                '-c:a', audio_codec,
+                '-b:a', audio_bitrate,
+                '-shortest',                # 以最短流为准（防止静音轨过长）
+                output_path
+            ])
+
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+            if preview_info == "yes":
+                logger.add_success(f"交叉淡化拼接完成 → {output_path}")
+
             return {
                 'success': True,
                 'temp_output': output_path
             }
-        
+
+        except subprocess.CalledProcessError as e:
+            error_msg = f"FFmpeg 执行失败: {e}\nstderr: {e.stderr}"
+            logger.add_error(error_msg)
+            return {'success': False, 'error': error_msg}
         except Exception as e:
-            return {
-                'success': False,
-                'error': f"交叉淡化拼接失败: {str(e)}"
-            }
+            error_msg = f"交叉淡化处理异常: {str(e)}"
+            logger.add_error(error_msg)
+            return {'success': False, 'error': error_msg}
     
     def _build_scale_filter(self, scale_mode, width, height, deinterlace):
         """
