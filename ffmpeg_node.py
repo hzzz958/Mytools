@@ -507,15 +507,12 @@ class FFmpegFpsConverter:
             log_output = logger.finish() if preview_info == "yes" else summary
 
             # 关键修改：包装成 VHS_FILENAMES，让 /history 和队列显示这个文件
-            filenames = []
-            if save_output == "yes" and output_path and os.path.exists(output_path):
-                filenames = [{
-                    "filename": output_filename,
-                    "subfolder": "",
-                    "type": "output"
-                }]
-
-            return (filenames, summary, log_output)
+            # 改后（对）
+            vhs_filenames = {
+                "filenames": [output_filename] if (save_output == "yes" and output_path) else [],
+                "subfolder": ""
+            }
+            return (vhs_filenames, summary, log_output)
 
         except Exception as e:
             logger.add_error(str(e))
