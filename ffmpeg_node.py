@@ -346,7 +346,7 @@ class FFmpegFpsConverter:
         }
    
     # 🔑 关键修改：改为返回 STRING 类型，而不是 VHS_FILENAMES
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_TYPES = ("VHS_FILENAMES", "STRING", "STRING")
     RETURN_NAMES = ("video_path", "summary", "detailed_log")
     FUNCTION = "convert_fps"
     CATEGORY = "MyTools/AudioVideo"
@@ -544,7 +544,12 @@ class FFmpegFpsConverter:
            
             # 🔑 关键修改：现在返回的是 STRING 类型的文件路径
             # ComfyUI 会正确识别这是一个生成的视频文件
-            return (output_path, summary, log_output)
+            # 改成：
+            vhs_filenames = {
+                "filenames": [output_filename],
+                "subfolder": ""
+            }
+            return (vhs_filenames, summary, log_output)
        
         except Exception as e:
             logger.add_error(str(e))
