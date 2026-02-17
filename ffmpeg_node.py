@@ -545,11 +545,14 @@ class FFmpegFpsConverter:
             # 🔑 关键修改：现在返回的是 STRING 类型的文件路径
             # ComfyUI 会正确识别这是一个生成的视频文件
             # 改成：
-            vhs_filenames = {
-                "filenames": [output_filename],
-                "subfolder": ""
-            }
-            return (vhs_filenames, summary, log_output)
+            filenames = []
+            if save_output == "yes" and output_path and os.path.exists(output_path):
+                filenames = [{
+                    "filename": output_filename,  # 用生成的文件名
+                    "subfolder": "",              # 输出目录无子文件夹
+                    "type": "output"
+                }]
+            return (filenames, summary, log_output)
        
         except Exception as e:
             logger.add_error(str(e))
