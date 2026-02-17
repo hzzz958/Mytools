@@ -287,6 +287,9 @@ class FFmpegUtils:
 # ============================================================================
 # 节点 1: FFmpeg 帧率转换（改进版 - 支持 VHS_FILENAMES 输出）
 # ============================================================================
+# ============================================================================
+# 节点 1: FFmpeg 帧率转换（改进版 - 改为返回 STRING 类型）
+# ============================================================================
 class FFmpegFpsConverter:
     """
     FFmpeg 视频帧率转换节点
@@ -298,8 +301,8 @@ class FFmpegFpsConverter:
     - 可选保存输出和预览信息
    
     修改:
-    - 返回 VHS_FILENAMES 类型，让 ComfyUI 队列/资产列表优先显示转换后的 30fps 文件
-    - filename_prefix 默认改为 "vc30"（可自行调整）
+    - 改为返回 STRING 类型（而不是 VHS_FILENAMES）
+    - ComfyUI 能正确识别生成的视频文件，并在任务队列中显示
     """
    
     @classmethod
@@ -320,7 +323,7 @@ class FFmpegFpsConverter:
             },
             "optional": {
                 "filename_prefix": ("STRING", {
-                    "default": "vc30",  # 修改默认前缀，便于识别为最终文件
+                    "default": "ffmpeg_converted",
                     "tooltip": "输出文件的前缀，完整名称会包含帧率和时间戳"
                 }),
                 "quality": (["low", "medium", "high"], {
@@ -342,14 +345,14 @@ class FFmpegFpsConverter:
             },
         }
    
-    # 修改关键：返回 VHS_FILENAMES 类型，让队列显示这个文件
-    RETURN_TYPES = ("VHS_FILENAMES", "STRING", "STRING")
-    RETURN_NAMES = ("Filenames", "summary", "detailed_log")
+    # 🔑 关键修改：改为返回 STRING 类型，而不是 VHS_FILENAMES
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("video_path", "summary", "detailed_log")
     FUNCTION = "convert_fps"
     CATEGORY = "MyTools/AudioVideo"
-    OUTPUT_NODE = True  # 标记为输出节点，队列更优先
+    OUTPUT_NODE = True
    
-    def convert_fps(self, video_path, fps, filename_prefix="vc30",
+    def convert_fps(self, video_path, fps, filename_prefix="ffmpeg_converted",
                    quality="medium", codec="libx264",
                    save_output="yes", preview_info="yes"):
         """
@@ -366,7 +369,7 @@ class FFmpegFpsConverter:
         8. 生成报告 - 输出处理总结和详细日志
        
         返回:
-            (VHS_FILENAMES, 简要总结, 详细日志) - VHS_FILENAMES 让 ComfyUI 优先显示转换后的文件
+            (video_path, 简要总结, 详细日志)
         """
        
         logger = ProgressLogger("FFmpeg 帧率转换")
@@ -522,7 +525,7 @@ class FFmpegFpsConverter:
                 output_size = estimated_size
                 if preview_info == "yes":
                     logger.add_success(f"处理完成（仅预览，未保存）")
-                output_path = "" # 返回空路径表示未保存
+                output_path = ""  # 返回空路径表示未保存
            
             # ========== 步骤 8: 生成总结 ==========
             if preview_info == "yes":
@@ -539,21 +542,14 @@ class FFmpegFpsConverter:
            
             log_output = logger.finish() if preview_info == "yes" else summary
            
-            # 关键修改：包装成 VHS_FILENAMES，让 ComfyUI 队列优先显示这个文件
-            filenames = []
-            # 返回标准的 VHS_FILENAMES 格式
-            vhs_filenames = {
-                "filenames": [output_filename] if (save_output == "yes" and output_path) else [],
-                "subfolder": ""
-            }
-              
-            return (vhs_filenames, summary, log_output)
+            # 🔑 关键修改：现在返回的是 STRING 类型的文件路径
+            # ComfyUI 会正确识别这是一个生成的视频文件
+            return (output_path, summary, log_output)
        
         except Exception as e:
             logger.add_error(str(e))
             log_output = logger.finish()
             raise Exception(f"{str(e)}")
-
 # ============================================================================
 # 节点 2: FFmpeg 视频信息获取
 # ============================================================================
