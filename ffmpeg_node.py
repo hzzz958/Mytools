@@ -293,18 +293,8 @@ class FFmpegUtils:
 class FFmpegFpsConverter:
     """
     FFmpeg 视频帧率转换节点
-   
-    功能:
-    - 将视频转换到指定帧率（1-120 fps）
-    - 支持多种编码器和质量级别
-    - 实时显示处理进度
-    - 可选保存输出和预览信息
-   
-    修改:
-    - 改为返回 STRING 类型（而不是 VHS_FILENAMES）
-    - ComfyUI 能正确识别生成的视频文件，并在任务队列中显示
+    修改：返回 VHS_FILENAMES 类型，让 ComfyUI /history 和队列显示转换后的文件
     """
-   
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -323,79 +313,57 @@ class FFmpegFpsConverter:
             },
             "optional": {
                 "filename_prefix": ("STRING", {
-                    "default": "ffmpeg_converted",
-                    "tooltip": "输出文件的前缀，完整名称会包含帧率和时间戳"
+                    "default": "ffmpeg_converted",  # 你的前缀
+                    "tooltip": "输出文件的前缀"
                 }),
                 "quality": (["low", "medium", "high"], {
-                    "default": "medium",
-                    "tooltip": "输出质量\nlow: 快速, 小文件 (2Mbps)\nmedium: 平衡 (5Mbps)\nhigh: 高质量, 大文件 (10Mbps)"
+                    "default": "medium"
                 }),
                 "codec": (["libx264", "libx265"], {
-                    "default": "libx264",
-                    "tooltip": "视频编码器\nlibx264: H.264 (兼容性好，更快)\nlibx265: H.265 (压缩率高，更慢)"
+                    "default": "libx264"
                 }),
                 "save_output": (["yes", "no"], {
-                    "default": "yes",
-                    "tooltip": "是否保存输出视频\nyes: 保存到输出目录\nno: 只预览信息，不保存"
+                    "default": "yes"
                 }),
                 "preview_info": (["yes", "no"], {
-                    "default": "yes",
-                    "tooltip": "是否显示详细的预览信息和进度反馈\nyes: 显示完整日志\nno: 只显示基本信息"
+                    "default": "yes"
                 }),
             },
         }
-   
-    # 🔑 关键修改：改为返回 STRING 类型，而不是 VHS_FILENAMES
+
+    # 关键修改：返回 VHS_FILENAMES 类型，让 history 和队列识别
     RETURN_TYPES = ("VHS_FILENAMES", "STRING", "STRING")
-    RETURN_NAMES = ("video_path", "summary", "detailed_log")
+    RETURN_NAMES = ("Filenames", "summary", "detailed_log")
     FUNCTION = "convert_fps"
     CATEGORY = "MyTools/AudioVideo"
-    OUTPUT_NODE = True
-   
+    OUTPUT_NODE = True  # 标记为输出节点，队列优先
+
     def convert_fps(self, video_path, fps, filename_prefix="ffmpeg_converted",
                    quality="medium", codec="libx264",
                    save_output="yes", preview_info="yes"):
-        """
-        执行帧率转换
-       
-        处理流程：
-        1. 环境检查 - 验证 FFmpeg 是否可用
-        2. 文件验证 - 检查输入文件是否有效
-        3. 视频分析 - 获取原始视频信息
-        4. 参数计算 - 计算输出参数和文件大小
-        5. 空间检查 - 确保磁盘有足够空间
-        6. 执行转换 - 运行 FFmpeg，实时显示进度
-        7. 验证输出 - 检查输出文件是否生成
-        8. 生成报告 - 输出处理总结和详细日志
-       
-        返回:
-            (video_path, 简要总结, 详细日志)
-        """
-       
         logger = ProgressLogger("FFmpeg 帧率转换")
-       
+
         try:
             # ========== 步骤 1: 环境检查 ==========
             if preview_info == "yes":
                 logger.add_section("1. 环境检查")
-               
                 if not FFmpegUtils.check_ffmpeg_installed(logger):
                     raise Exception("FFmpeg 未安装或不在 PATH 中")
             else:
                 if not FFmpegUtils.check_ffmpeg_installed():
                     raise Exception("FFmpeg 未安装或不在 PATH 中")
-           
+
             # ========== 步骤 2: 验证输入文件 ==========
             if preview_info == "yes":
                 logger.add_section("2. 验证输入文件")
                 video_path = FFmpegUtils.validate_input_file(video_path, logger)
             else:
                 video_path = FFmpegUtils.validate_input_file(video_path)
-           
+
             # ========== 步骤 3: 获取视频信息 ==========
             if preview_info == "yes":
                 logger.add_section("3. 获取视频信息")
-           
+
             cmd_info = [
                 'ffprobe',
                 '-v', 'error',
@@ -404,25 +372,25 @@ class FFmpegFpsConverter:
                 '-of', 'json',
                 video_path
             ]
-           
+
             result = subprocess.run(cmd_info, capture_output=True, text=True, check=True)
             data = json.loads(result.stdout)
             stream = data['streams'][0]
-           
+
             orig_width = int(stream.get('width', 0))
             orig_height = int(stream.get('height', 0))
             orig_duration = float(stream.get('duration', 0))
-           
+
             if preview_info == "yes":
                 logger.add_info("分辨率", f"{orig_width}×{orig_height}")
                 logger.add_info("时长", f"{orig_duration:.2f}s ({int(orig_duration//60)}m {int(orig_duration%60)}s)")
-           
+
             # ========== 步骤 4: 计算输出参数 ==========
             if preview_info == "yes":
                 logger.add_section("4. 计算输出参数")
-           
+
             estimated_size = FFmpegUtils.estimate_output_size(orig_duration, quality)
-           
+
             if preview_info == "yes":
                 logger.add_info("输出尺寸", f"{orig_width}×{orig_height}")
                 logger.add_info("输出帧率", f"{fps} fps")
@@ -430,38 +398,38 @@ class FFmpegFpsConverter:
                 logger.add_info("质量级别", quality)
                 logger.add_info("估算文件大小", f"{estimated_size:.2f}MB")
                 logger.add_info("保存输出", save_output)
-           
+
             # ========== 步骤 5: 检查磁盘空间 ==========
             output_dir = folder_paths.get_output_directory()
             _, ext = os.path.splitext(video_path)
             if not ext:
                 ext = ".mp4"
-           
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_filename = f"{filename_prefix}_{int(fps)}fps_{timestamp}{ext}"
             output_path = os.path.join(output_dir, output_filename)
-           
+
             if save_output == "yes":
                 if preview_info == "yes":
                     logger.add_section("5. 检查磁盘空间")
-               
+
                 has_space, free_space = FFmpegUtils.check_disk_space(output_path, estimated_size * 1.2)
                 if not has_space:
                     if preview_info == "yes":
                         logger.add_error(f"空间不足! 需要 {estimated_size*1.2:.2f}MB, 仅有 {free_space:.2f}MB")
                     raise Exception(f"磁盘空间不足")
-               
+
                 if preview_info == "yes":
                     logger.add_success(f"空间充足 (可用 {free_space:.2f}MB)")
-           
+
             # ========== 步骤 6: 执行转换 ==========
             if preview_info == "yes":
                 logger.add_section("6. 执行转换")
                 logger.add_info("开始时间", datetime.now().strftime("%H:%M:%S"))
-           
+
             crf_map = {"low": 28, "medium": 18, "high": 10}
             crf = crf_map.get(quality, 18)
-           
+
             cmd = [
                 'ffmpeg',
                 '-y',
@@ -473,12 +441,10 @@ class FFmpegFpsConverter:
                 '-b:a', '128k',
                 output_path
             ]
-           
-            # 如果不保存，输出到 /dev/null（仅进行处理，不保存）
+
             if save_output == "no":
                 cmd[-1] = '-f' if os.name == 'nt' else '/dev/null'
-           
-            # 执行 FFmpeg
+
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -486,15 +452,13 @@ class FFmpegFpsConverter:
                 universal_newlines=True,
                 bufsize=1
             )
-           
-            # 逐行读取输出，获取进度
+
             line_count = 0
             for line in process.stdout:
                 line = line.strip()
                 if not line:
                     continue
-               
-                # 每 10 行打印一次进度（避免输出过多）
+
                 if preview_info == "yes" and ('frame=' in line or 'time=' in line):
                     line_count += 1
                     if line_count % 10 == 0:
@@ -504,20 +468,20 @@ class FFmpegFpsConverter:
                                 f"进度 [{info.get('time', 'N/A')}]",
                                 f"帧: {info.get('frame', 0)} FPS: {info.get('fps', 0):.1f} 速度: {info.get('speed', 0):.2f}x"
                             )
-           
+
             process.wait()
-           
+
             if process.returncode != 0:
                 raise Exception(f"FFmpeg 处理失败 (代码: {process.returncode})")
-           
+
             # ========== 步骤 7: 验证输出 ==========
             if preview_info == "yes":
                 logger.add_section("7. 验证输出")
-           
+
             if save_output == "yes":
                 if not os.path.exists(output_path):
                     raise Exception("输出文件未生成")
-               
+
                 output_size = os.path.getsize(output_path) / 1024 / 1024
                 if preview_info == "yes":
                     logger.add_success(f"文件已生成 ({output_size:.2f}MB)")
@@ -525,35 +489,34 @@ class FFmpegFpsConverter:
                 output_size = estimated_size
                 if preview_info == "yes":
                     logger.add_success(f"处理完成（仅预览，未保存）")
-                output_path = ""  # 返回空路径表示未保存
-           
+                output_path = ""
+
             # ========== 步骤 8: 生成总结 ==========
             if preview_info == "yes":
                 logger.add_section("8. 处理总结")
                 logger.add_info("输出文件", output_filename)
                 logger.add_info("输出大小", f"{output_size:.2f}MB")
-           
+
             summary = (
                 f"✓ 转换成功!\n"
                 f"输入: {os.path.basename(video_path)} ({orig_width}×{orig_height})\n"
                 f"输出: {output_filename} ({output_size:.2f}MB)\n"
                 f"参数: {fps}fps, {codec}, 质量{quality}"
             )
-           
+
             log_output = logger.finish() if preview_info == "yes" else summary
-           
-            # 🔑 关键修改：现在返回的是 STRING 类型的文件路径
-            # ComfyUI 会正确识别这是一个生成的视频文件
-            # 改成：
+
+            # 关键修改：包装成 VHS_FILENAMES，让 /history 和队列显示这个文件
             filenames = []
             if save_output == "yes" and output_path and os.path.exists(output_path):
                 filenames = [{
-                    "filename": output_filename,  # 用生成的文件名
-                    "subfolder": "",              # 输出目录无子文件夹
+                    "filename": output_filename,
+                    "subfolder": "",
                     "type": "output"
                 }]
+
             return (filenames, summary, log_output)
-       
+
         except Exception as e:
             logger.add_error(str(e))
             log_output = logger.finish()
