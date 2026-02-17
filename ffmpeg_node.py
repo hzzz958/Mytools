@@ -508,8 +508,9 @@ class FFmpegFpsConverter:
 
             # 关键修改：包装成 VHS_FILENAMES，让 /history 和队列显示这个文件
             # 改后（对）
+            # 改成（对的）
             vhs_filenames = {
-                "filenames": [output_filename] if (save_output == "yes" and output_path) else [],
+                "filenames": [output_filename] if save_output == "yes" else [],
                 "subfolder": ""
             }
             return (vhs_filenames, summary, log_output)
