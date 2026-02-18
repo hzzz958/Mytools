@@ -1,9 +1,9 @@
 """
-FFmpeg 视频拼接节点 - 修复版本
+FFmpeg 视频拼接节点 - 修复版本（独立输出资产版，不依赖 VHS）
 功能：拼接多个视频文件，支持多种过渡效果和完整的参数控制
 作者：AI Assistant
 日期：2024
-版本：2.0（已修复 8 个问题）
+版本：2.1（添加独立资产输出到 history）
 
 修复内容：
   P0（严重）:
@@ -16,6 +16,10 @@ FFmpeg 视频拼接节点 - 修复版本
     6. FFmpeg 编码器检查 - 检查必要编码器可用性
     7. 时间戳精度 - 使用微秒级精度避免冲突
     8. 超时保护 - 根据文件大小计算合理超时
+
+新增：
+- 返回 {"ui": {"images": [...]}} 格式，让 ComfyUI history 面板显示生成的视频文件作为资产条目
+- 不依赖 VideoHelperSuite (VHS)
 """
 
 import os
@@ -524,8 +528,8 @@ class FFmpegVideoConcatenate:
             }
         }
     
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("video_path", "video_info", "processing_log", "detected_issues")
+    RETURN_TYPES = ()
+    RETURN_NAMES = ()
     FUNCTION = "concatenate_videos"
     CATEGORY = "MyTools/AudioVideo"
     OUTPUT_NODE = True
@@ -582,7 +586,7 @@ class FFmpegVideoConcatenate:
             preview_info: 是否显示详细信息
         
         返回：
-            (视频路径, 视频信息, 处理日志, 检测问题)
+            ui 字典，用于在 history 面板显示生成的视频文件作为资产
         """
         
         logger = ProgressLogger("FFmpeg 视频拼接")
@@ -717,7 +721,7 @@ class FFmpegVideoConcatenate:
                 log_output = logger.finish()
                 issues_summary = logger.get_issues_summary()
                 
-                return ("", "检测模式，未进行拼接", log_output, issues_summary)
+                return {"ui": {"images": []}}
             
             # ========== 步骤 5: 创建临时目录 ==========
             if preview_info == "yes":
@@ -848,12 +852,30 @@ class FFmpegVideoConcatenate:
             
             issues_summary = logger.get_issues_summary()
             
-            return (output_path, video_info_summary, log_output, issues_summary)
+            # ========== 关键修改：返回 ui 格式，让 history 显示资产 ==========
+            ui_results = []
+            if os.path.exists(output_path):
+                ui_results = [{
+                    "filename": output_filename,
+                    "subfolder": "",  # 如果使用了子文件夹，可以在这里修改
+                    "type": "output"
+                }]
+            
+            return {
+                "ui": {
+                    "images": ui_results
+                }
+            }
         
         except Exception as e:
             logger.add_error(str(e))
             log_output = logger.finish()
-            raise Exception(f"拼接失败: {str(e)}")
+            # 失败时返回空 ui，避免前端异常
+            return {
+                "ui": {
+                    "images": []
+                }
+            }
         
         finally:
             # 【修复 P0-5】最终清理：无论成功或失败都会执行
