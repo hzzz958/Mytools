@@ -287,13 +287,10 @@ class FFmpegUtils:
 # ============================================================================
 # 节点 1: FFmpeg 帧率转换（改进版 - 支持 VHS_FILENAMES 输出）
 # ============================================================================
-# ============================================================================
-# 节点 1: FFmpeg 帧率转换（改进版 - 改为返回 STRING 类型）
-# ============================================================================
 class FFmpegFpsConverter:
     """
-    FFmpeg 视频帧率转换节点
-    修改：返回 VHS_FILENAMES 类型，让 /history 和队列显示转换后的文件
+    FFmpeg 视频帧率转换节点（独立版，不依赖 VHS）
+    输出文件保存到 output/，并在 history 面板显示文件名条目
     """
     @classmethod
     def INPUT_TYPES(cls):
@@ -313,7 +310,7 @@ class FFmpegFpsConverter:
             },
             "optional": {
                 "filename_prefix": ("STRING", {
-                    "default": "ffmpeg_converted",  # 你的前缀
+                    "default": "ffmpeg_converted",
                     "tooltip": "输出文件的前缀"
                 }),
                 "quality": (["low", "medium", "high"], {
@@ -331,16 +328,15 @@ class FFmpegFpsConverter:
             },
         }
 
-    # 关键修改：返回 VHS_FILENAMES 类型
-    RETURN_TYPES = ("VHS_FILENAMES", "STRING", "STRING")
-    RETURN_NAMES = ("Filenames", "summary", "detailed_log")
+    RETURN_TYPES = ()  # 纯输出节点，无下游连接
+    RETURN_NAMES = ()
     FUNCTION = "convert_fps"
     CATEGORY = "MyTools/AudioVideo"
-    OUTPUT_NODE = True  # 标记为输出节点，队列优先
+    OUTPUT_NODE = True  # 强制执行，即使无下游
 
     def convert_fps(self, video_path, fps, filename_prefix="ffmpeg_converted",
-                   quality="medium", codec="libx264",
-                   save_output="yes", preview_info="yes"):
+                    quality="medium", codec="libx264",
+                    save_output="yes", preview_info="yes"):
         logger = ProgressLogger("FFmpeg 帧率转换")
 
         try:
@@ -506,16 +502,21 @@ class FFmpegFpsConverter:
 
             log_output = logger.finish() if preview_info == "yes" else summary
 
-            # 关键修改：包装成 VHS_FILENAMES 格式，让 /history 和队列显示这个文件
-            filenames = []
+            # ========== 关键：构造 ui 输出，让 history 显示文件名 ==========
+            ui_results = []
             if save_output == "yes" and output_path and os.path.exists(output_path):
-                filenames = [{
-                    "filename": output_filename,
-                    "subfolder": "",
+                ui_results = [{
+                    "filename": output_filename,   # 只放文件名（ComfyUI 会从 output/ 自动找）
+                    "subfolder": "",               # 如用了子文件夹，改成实际名称
                     "type": "output"
                 }]
 
-            return (filenames, summary, log_output)
+            # 返回 ui 字典（模仿 Save Image）
+            return {
+                "ui": {
+                    "images": ui_results   # 用 "images" 键，即使是 .mp4 文件，history 会显示条目
+                }
+            }
 
         except Exception as e:
             logger.add_error(str(e))
