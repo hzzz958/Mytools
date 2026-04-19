@@ -386,9 +386,25 @@ class PracticalRIFE_Direct:
                       f"耗时: {seg_duration:.1f}s | "
                       f"剩余: {est_remaining/60:.1f}min")
         
-        # 合并所有段
+        # 合并所有段 - 使用预分配+逐段写入，避免 torch.cat 的内存翻倍问题
         print(f"[合并] 拼接 {len(all_outputs)} 个段的输出...")
-        out_tensor = torch.cat(all_outputs, dim=0)
+        
+        total_frames = sum(t.shape[0] for t in all_outputs)
+        C, H, W = all_outputs[0].shape[1], all_outputs[0].shape[2], all_outputs[0].shape[3]
+        
+        # 预分配目标 tensor，避免 cat 时的 2x 内存峰值
+        out_tensor = torch.empty(total_frames, C, H, W, dtype=all_outputs[0].dtype)
+        
+        offset = 0
+        for t in all_outputs:
+            chunk_size = t.shape[0]
+            out_tensor[offset:offset + chunk_size] = t
+            offset += chunk_size
+            del t  # 写入后立即释放
+        
+        all_outputs.clear()
+        gc.collect()
+        
         return out_tensor.permute(0, 2, 3, 1)
 
     def _process_single_pass(self, frames, multi, scale, n):
