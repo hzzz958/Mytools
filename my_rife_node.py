@@ -5,6 +5,8 @@ import os
 import time
 import gc
 import psutil
+import tempfile
+import shutil
 
 RIFE_PATH = "/workspace/Practical-RIFE"
 if RIFE_PATH not in sys.path:
@@ -17,25 +19,18 @@ except ImportError:
 
 class PracticalRIFE_Direct:
     """
-    RIFE 视频帧插值节点 - 自适应内存管理版
+    RIFE 视频帧插值节点 - 预分配内存版
     
     === 核心改进 ===
-    ✅ 自动检测输入规模（512帧、3000帧、10000帧都能处理）
-    ✅ 自动计算最优处理策略（不需要用户手调参数）
-    ✅ 智能内存管理（内存占用始终 < 50GB）
-    ✅ 无需额外磁盘空间（使用分段处理而非磁盘缓冲）
-    ✅ 完全兼容原接口（无缝替换原文件）
-    ✅ 支持任意帧数、任意倍数、任意分辨率
+    ✅ 去掉分段逻辑，改用预分配 + 写盘两条路径
+    ✅ 预分配：一次性分配输出 tensor，逐帧写入，零额外拷贝
+    ✅ 写盘：内存紧张时写临时文件，读回时同样用预分配
+    ✅ 自动判断走哪条路径，无需用户手调
     
-    === 处理策略 ===
-    小数据（<512帧）→ 直接处理（快）
-    中等数据（512-2000帧）→ 分段处理 segment_size=256
-    大数据（2000-10000帧）→ 分段处理 segment_size=128
-    超大数据（10000+帧）→ 分段处理 segment_size=64
-    
-    === 内存占用 ===
-    无论输入多少帧，内存占用都在 30-50GB 之间
-    随着分辨率增加会线性增加，但不会因帧数多而爆炸
+    === 内存模型 ===
+    预分配路径：输入 frames + 输出 tensor 同时存在
+    写盘路径：输入 frames + 磁盘 I/O，读回时只需输出 tensor
+    峰值内存 ≈ max(输入大小, 输出大小)，不会翻倍
     """
     
     def __init__(self):
@@ -77,19 +72,18 @@ class PracticalRIFE_Direct:
                 "auto_memory_mode": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "✅ 推荐保持 True（自动内存管理）\n"
-                               "节点会自动根据帧数调整处理策略\n"
-                               "无需手调参数，内存占用始终可控\n"
-                               "设为 False 时使用原始单段处理（不推荐）"
+                               "节点会自动根据输出大小选择处理路径\n"
+                               "设为 False 时使用预分配模式"
                 }),
                 "memory_limit_gb": ("INT", {
-                    "default": 50,
+                    "default": 40,
                     "min": 20,
                     "max": 200,
                     "step": 5,
                     "tooltip": "最多允许使用多少 GB 系统内存\n"
-                               "自动模式会根据这个值调整处理策略\n"
-                               "如果你的机器内存少，改成 30 或 40\n"
-                               "如果你的机器内存多，改成 100 或更多（会更快）"
+                               "自动模式会根据这个值选择预分配或写盘\n"
+                               "如果你的机器内存少，改成 30\n"
+                               "如果你的机器内存多，改成 60 或更多（会更快）"
                 }),
             },
         }
@@ -125,27 +119,51 @@ class PracticalRIFE_Direct:
         n, h, w, c = images.shape
         start_time = time.time()
         
+        # 计算输出帧数
+        output_frames = (n - 1) * multi + 1
+        
         print(f"\n{'='*75}")
-        print(f"[RIFE 自适应内存管理版]")
+        print(f"[RIFE 预分配内存版]")
         print(f"  输入帧数: {n:,} 帧")
         print(f"  分辨率: {w}×{h}")
         print(f"  插帧倍数: {multi}x")
-        print(f"  预期输出帧数: {(n-1)*multi + 1:,}")
+        print(f"  预期输出帧数: {output_frames:,}")
         
-        # 估算内存占用
         self._log_memory_info()
         
-        # 使用自适应模式
-        if auto_memory_mode:
-            result = self._adaptive_process(
-                images, multi, scale, memory_limit_gb, n, h, w
-            )
+        # 计算输出 tensor 大小
+        bytes_per_frame = w * h * c * 4  # float32 = 4 bytes
+        total_output_gb = output_frames * bytes_per_frame / (1024**3)
+        
+        # 获取有效内存限制
+        try:
+            total_system_memory_gb = psutil.virtual_memory().total / (1024**3)
+        except:
+            total_system_memory_gb = 128
+        
+        effective_limit_gb = min(memory_limit_gb, total_system_memory_gb * 0.45)
+        
+        print(f"  输出 tensor 大小: {total_output_gb:.1f} GB")
+        print(f"  有效内存限制: {effective_limit_gb:.1f} GB")
+        
+        # 决策：预分配还是写盘
+        use_disk = auto_memory_mode and (total_output_gb > effective_limit_gb * 0.5)
+        
+        if use_disk:
+            print(f"\n[决策] 输出较大，使用写盘路径")
+            print(f"  原因: {total_output_gb:.1f}GB > {effective_limit_gb * 0.5:.1f}GB (限制×0.5)")
         else:
-            # 后向兼容：不使用自适应模式（不推荐）
-            print(f"\n⚠️  警告: 自适应模式已禁用，使用原始处理")
-            print(f"  这可能导致大数据集时内存不足！")
-            frames = images.permute(0, 3, 1, 2).to(self.device)
-            result = self._process_single_pass(frames, multi, scale, n)
+            print(f"\n[决策] 输出适中，使用预分配路径")
+            print(f"  原因: {total_output_gb:.1f}GB <= {effective_limit_gb * 0.5:.1f}GB (限制×0.5)")
+        
+        # 转换维度：ComfyUI IMAGE (N, H, W, C) → 模型输入 (N, C, H, W)
+        frames = images.permute(0, 3, 1, 2).to(self.device)
+        
+        # 执行处理
+        if use_disk:
+            result = self._process_disk(frames, multi, scale, n, output_frames, c, h, w)
+        else:
+            result = self._process_preallocate(frames, multi, scale, n, output_frames, c, h, w)
         
         duration = time.time() - start_time
         print(f"\n✅ 任务完成！")
@@ -156,141 +174,6 @@ class PracticalRIFE_Direct:
         
         return (result,)
 
-    def _adaptive_process(self, images, multi, scale, memory_limit_gb, n, h, w):
-        """
-        自适应处理主逻辑
-        根据输入规模自动选择处理策略
-        """
-        # 计算数据规模
-        output_frames = (n - 1) * multi + 1
-        bytes_per_frame = w * h * 4  # RGBA
-        total_output_bytes = output_frames * bytes_per_frame
-        total_output_gb = total_output_bytes / (1024**3)
-        
-        # 自动决策
-        strategy = self._decide_strategy(n, multi, total_output_gb, memory_limit_gb)
-        
-        print(f"  内存占用预测: 输出 {total_output_gb:.1f} GB 数据")
-        print(f"\n[自动配置]")
-        print(f"  检测规模: {self._get_scale_label(n)}")
-        print(f"  处理策略: {strategy['name']}")
-        print(f"  段大小: {strategy['segment_size']}")
-        print(f"  预计段数: {strategy['num_segments']}")
-        print(f"  单段峰值内存: {strategy['memory_per_segment']:.1f} GB")
-        print(f"  总峰值内存: {strategy['total_peak_memory']:.1f} GB")
-        
-        frames = images.permute(0, 3, 1, 2).to(self.device)
-        
-        # 执行处理
-        if strategy['type'] == 'direct':
-            return self._process_direct(frames, multi, scale, n)
-        else:  # segment
-            return self._process_segment(
-                frames, multi, scale, n, 
-                strategy['segment_size']
-            )
-
-    def _decide_strategy(self, n, multi, total_output_gb, memory_limit_gb):
-        """
-        决策最优处理策略
-        返回字典包含处理方式、段大小、内存占用等信息
-        """
-        # 获取系统总内存
-        try:
-            total_system_memory_gb = psutil.virtual_memory().total / (1024**3)
-        except:
-            total_system_memory_gb = 128  # 默认假设 128GB
-        
-        # 获取 GPU 显存
-        if torch.cuda.is_available():
-            try:
-                gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            except:
-                gpu_mem_gb = 24  # 保守估计 3090
-        else:
-            gpu_mem_gb = 0
-        
-        # ==================== BUG FIX ====================
-        # 如果 memory_limit_gb 设置过高（接近系统总内存），自动调低
-        # 原来的问题：memory_limit_gb=50，系统只有 62GB，导致爆内存
-        # 修复：确保内存限制不超过系统的 45%（留余量给系统和 Swap）
-        max_safe_limit_gb = int(total_system_memory_gb * 0.45)
-        if memory_limit_gb > max_safe_limit_gb:
-            print(f"\n  ⚠️  内存限制过高（{memory_limit_gb}GB > 系统可安全用 {max_safe_limit_gb}GB）")
-            print(f"     自动调降至 {max_safe_limit_gb}GB 以避免爆内存")
-            memory_limit_gb = max_safe_limit_gb
-        
-        # 段大小候选
-        if n < 512:
-            # 小数据：直接处理
-            segment_size = n
-            strategy_type = 'direct'
-            name = '直接处理（快速）'
-        elif n < 2000:
-            # 中等数据
-            segment_size = 256
-            strategy_type = 'segment'
-            name = f'分段处理 (segment_size={segment_size})'
-        elif n < 10000:
-            # 大数据
-            segment_size = 128
-            strategy_type = 'segment'
-            name = f'分段处理 (segment_size={segment_size})'
-        else:
-            # 超大数据
-            segment_size = 64
-            strategy_type = 'segment'
-            name = f'分段处理 (segment_size={segment_size})'
-        
-        # 计算段数
-        if strategy_type == 'direct':
-            num_segments = 1
-        else:
-            num_segments = (n + segment_size - 1) // segment_size
-        
-        # 估算单段内存占用
-        frame_bytes = 1920 * 1088 * 4  # 针对 1920×1088 的估算
-        segment_output_frames = min(segment_size, n) * multi
-        memory_per_segment = (
-            segment_output_frames * frame_bytes / (1024**3) +  # 输出帧
-            gpu_mem_gb +  # GPU 模型
-            5  # 系统开销
-        )
-        
-        # 总峰值内存（加上缓冲和其他程序）
-        total_peak_memory = memory_per_segment + 10  # 再加 10GB 缓冲
-        
-        # 如果预测的内存超过限制，自动降低段大小
-        if total_peak_memory > memory_limit_gb:
-            # 激进降低段大小，直到符合内存限制
-            reduction_factor = int(total_peak_memory / memory_limit_gb) + 1
-            segment_size = max(32, segment_size // reduction_factor)
-            num_segments = (n + segment_size - 1) // segment_size
-            name = f'分段处理 (自动降低) (segment_size={segment_size})'
-            print(f"\n  ⚠️  检测到内存压力，自动降低段大小")
-            print(f"     原预测：{total_peak_memory:.1f}GB > 限制：{memory_limit_gb}GB")
-            print(f"     调整段大小为：{segment_size}")
-        
-        return {
-            'type': strategy_type,
-            'name': name,
-            'segment_size': segment_size,
-            'num_segments': num_segments,
-            'memory_per_segment': memory_per_segment,
-            'total_peak_memory': min(total_peak_memory, memory_limit_gb)
-        }
-
-    def _get_scale_label(self, n):
-        """获取数据规模标签"""
-        if n < 512:
-            return "小规模（<512帧）"
-        elif n < 2000:
-            return "中等规模（512-2000帧）"
-        elif n < 10000:
-            return "大规模（2000-10000帧）"
-        else:
-            return "超大规模（10000+帧）"
-
     def _log_memory_info(self):
         """打印当前系统内存信息"""
         try:
@@ -299,141 +182,133 @@ class PracticalRIFE_Direct:
         except:
             pass
 
-    def _process_direct(self, frames, multi, scale, n):
+    def _process_preallocate(self, frames, multi, scale, n, output_frames, c, h, w):
         """
-        直接处理（小数据集）
+        预分配路径：一次性分配输出 tensor，逐帧写入
+        峰值内存：输入 frames + 输出 tensor，无额外拷贝
         """
-        print(f"\n[处理] 直接处理模式")
+        print(f"\n[处理] 预分配模式")
         
-        output_list = []
+        # 预分配输出 tensor（CPU 上，float32）
+        out_tensor = torch.empty(output_frames, c, h, w, dtype=torch.float32)
+        print(f"  预分配完成: {output_frames} 帧 × {c}×{h}×{w}")
+        
+        write_idx = 0
+        total_pairs = n - 1
+        
         with torch.no_grad():
-            for i in range(n - 1):
+            for i in range(total_pairs):
                 I0 = frames[i:i+1]
                 I1 = frames[i+1:i+2]
                 
-                output_list.append(I0.cpu())
+                # 写入 I0
+                out_tensor[write_idx] = I0[0].cpu()
+                write_idx += 1
                 
+                # 写入插值帧
                 for step in range(1, multi):
                     timestep = step / multi
                     interp = self.model.inference(I0, I1, timestep=timestep, scale=scale)
-                    output_list.append(interp.cpu())
+                    out_tensor[write_idx] = interp[0].cpu()
+                    write_idx += 1
                 
-                if i % max(1, (n-1)//10) == 0 and i > 0:
-                    progress = int(100 * i / (n-1))
-                    print(f"  处理中: {progress}% ({i}/{n-1})")
+                # 进度
+                if i % max(1, total_pairs // 10) == 0 and i > 0:
+                    progress = int(100 * i / total_pairs)
+                    print(f"  处理中: {progress}% ({i}/{total_pairs})")
             
-            output_list.append(frames[-1:].cpu())
+            # 写入最后一帧
+            out_tensor[write_idx] = frames[-1].cpu()
         
-        out_tensor = torch.cat(output_list, dim=0)
+        print(f"  写入完成: {write_idx + 1} 帧")
+        
+        # 转换维度：(N, C, H, W) → (N, H, W, C) ComfyUI 格式
         return out_tensor.permute(0, 2, 3, 1)
 
-    def _process_segment(self, frames, multi, scale, n, segment_size):
+    def _process_disk(self, frames, multi, scale, n, output_frames, c, h, w):
         """
-        分段处理（大数据集）
+        写盘路径：推理时写临时文件，读回时用预分配
+        峰值内存：输入 frames（推理时）或 输出 tensor（读回时）
         """
-        num_segments = (n + segment_size - 1) // segment_size
-        print(f"\n[处理] 分段处理模式 ({num_segments} 段)")
+        print(f"\n[处理] 写盘模式")
         
-        all_outputs = []
-        total_start = time.time()
+        # 创建临时目录
+        temp_dir = tempfile.mkdtemp(prefix="rife_")
+        print(f"  临时目录: {temp_dir}")
         
-        with torch.no_grad():
-            for seg_idx in range(num_segments):
-                seg_start = seg_idx * segment_size
-                seg_end = min(seg_start + segment_size, n)
-                
-                seg_start_time = time.time()
-                
-                # 提取当前段
-                segment_frames = frames[seg_start:seg_end]
-                
-                # 处理当前段
-                seg_output = []
-                for i in range(segment_frames.shape[0] - 1):
-                    I0 = segment_frames[i:i+1]
-                    I1 = segment_frames[i+1:i+2]
+        temp_files = []
+        file_idx = 0
+        total_pairs = n - 1
+        
+        try:
+            # === 阶段1：推理 + 写盘 ===
+            print(f"  [阶段1] 推理并写入临时文件...")
+            
+            with torch.no_grad():
+                for i in range(total_pairs):
+                    I0 = frames[i:i+1]
+                    I1 = frames[i+1:i+2]
                     
-                    seg_output.append(I0.cpu())
+                    # 保存 I0
+                    temp_path = os.path.join(temp_dir, f"{file_idx:06d}.pt")
+                    torch.save(I0[0].cpu(), temp_path)
+                    temp_files.append(temp_path)
+                    file_idx += 1
                     
+                    # 保存插值帧
                     for step in range(1, multi):
                         timestep = step / multi
                         interp = self.model.inference(I0, I1, timestep=timestep, scale=scale)
-                        seg_output.append(interp.cpu())
+                        temp_path = os.path.join(temp_dir, f"{file_idx:06d}.pt")
+                        torch.save(interp[0].cpu(), temp_path)
+                        temp_files.append(temp_path)
+                        file_idx += 1
+                    
+                    # 进度
+                    if i % max(1, total_pairs // 10) == 0 and i > 0:
+                        progress = int(100 * i / total_pairs)
+                        print(f"    写入: {progress}% ({i}/{total_pairs})")
                 
-                seg_output.append(segment_frames[-1:].cpu())
-                seg_tensor = torch.cat(seg_output, dim=0)
-                
-                # 处理段边界
-                if seg_idx == 0:
-                    all_outputs.append(seg_tensor)
-                else:
-                    # 后续段跳过第一帧（与前一段最后一帧重复）
-                    all_outputs.append(seg_tensor[1:])
-                
-                # 清理
-                del segment_frames, seg_output, seg_tensor
-                torch.cuda.empty_cache()
-                gc.collect()
-                
-                # 进度信息
-                seg_duration = time.time() - seg_start_time
-                total_elapsed = time.time() - total_start
-                est_total_time = total_elapsed / (seg_idx + 1) * num_segments
-                est_remaining = est_total_time - total_elapsed
-                
-                progress = int(100 * (seg_idx + 1) / num_segments)
-                print(f"  段 {seg_idx+1}/{num_segments} ({progress}%) "
-                      f"耗时: {seg_duration:.1f}s | "
-                      f"剩余: {est_remaining/60:.1f}min")
-        
-        # 合并所有段 - 使用预分配+逐段写入，避免 torch.cat 的内存翻倍问题
-        print(f"[合并] 拼接 {len(all_outputs)} 个段的输出...")
-        
-        total_frames = sum(t.shape[0] for t in all_outputs)
-        C, H, W = all_outputs[0].shape[1], all_outputs[0].shape[2], all_outputs[0].shape[3]
-        
-        # 预分配目标 tensor，避免 cat 时的 2x 内存峰值
-        out_tensor = torch.empty(total_frames, C, H, W, dtype=all_outputs[0].dtype)
-        
-        offset = 0
-        for t in all_outputs:
-            chunk_size = t.shape[0]
-            out_tensor[offset:offset + chunk_size] = t
-            offset += chunk_size
-            del t  # 写入后立即释放
-        
-        all_outputs.clear()
-        gc.collect()
-        
-        return out_tensor.permute(0, 2, 3, 1)
-
-    def _process_single_pass(self, frames, multi, scale, n):
-        """
-        原始单段处理（不推荐用于大数据）
-        保留用于后向兼容
-        """
-        output_frames_cpu = []
-        
-        with torch.no_grad():
-            for i in range(n - 1):
-                I0 = frames[i:i+1]
-                I1 = frames[i+1:i+2]
-                
-                output_frames_cpu.append(I0.cpu())
-                
-                for step in range(1, multi):
-                    timestep = step / multi
-                    interp_frame = self.model.inference(I0, I1, timestep=timestep, scale=scale)
-                    output_frames_cpu.append(interp_frame.cpu())
-                
-                if i % 50 == 0 and i > 0:
-                    print(f"  进度: {i}/{n-1}")
+                # 保存最后一帧
+                temp_path = os.path.join(temp_dir, f"{file_idx:06d}.pt")
+                torch.save(frames[-1].cpu(), temp_path)
+                temp_files.append(temp_path)
             
-            output_frames_cpu.append(frames[-1:].cpu())
+            print(f"  [阶段1] 完成，共写入 {len(temp_files)} 个文件")
+            
+            # 释放 GPU 显存
+            del frames
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # === 阶段2：读回 + 预分配 ===
+            print(f"  [阶段2] 读回并组装输出 tensor...")
+            
+            # 预分配输出 tensor
+            out_tensor = torch.empty(len(temp_files), c, h, w, dtype=torch.float32)
+            
+            for idx, temp_path in enumerate(temp_files):
+                t = torch.load(temp_path)
+                out_tensor[idx] = t
+                del t
+                
+                if idx % 100 == 0 and idx > 0:
+                    progress = int(100 * idx / len(temp_files))
+                    print(f"    读回: {progress}% ({idx}/{len(temp_files)})")
+            
+            print(f"  [阶段2] 完成")
+            
+        finally:
+            # 清理临时目录
+            try:
+                shutil.rmtree(temp_dir)
+                print(f"  临时文件已清理")
+            except Exception as e:
+                print(f"  清理临时文件失败: {e}")
         
-        out_tensor = torch.cat(output_frames_cpu, dim=0)
+        # 转换维度
         return out_tensor.permute(0, 2, 3, 1)
 
 
 NODE_CLASS_MAPPINGS = {"PracticalRIFE_Direct": PracticalRIFE_Direct}
-NODE_DISPLAY_NAME_MAPPINGS = {"PracticalRIFE_Direct": "🚀 RIFE 自适应内存管理版"}
+NODE_DISPLAY_NAME_MAPPINGS = {"PracticalRIFE_Direct": "🚀 RIFE 预分配内存版"}
